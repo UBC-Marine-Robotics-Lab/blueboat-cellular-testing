@@ -1,8 +1,11 @@
-"""Regression coverage for serving-cell extraction without a connected modem."""
+"""Regression coverage for modem monitoring without connected hardware."""
 
+from contextlib import ExitStack
+import csv
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 import urllib.error
@@ -173,6 +176,7 @@ class ReadCellMetricsTests(unittest.TestCase):
         failure = urllib.error.HTTPError(
             API_BASE, 503, "Service Unavailable", None, None
         )
+        self.addCleanup(failure.close)
         with mock.patch.object(
             diagnostics, "request_json", side_effect=[payload, failure]
         ):
@@ -278,6 +282,337 @@ class RequestJsonTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.full_url, API_BASE + "/commander")
+
+
+class ModemMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.contexts = ExitStack()
+        self.addCleanup(self.contexts.close)
+        self.modem = {
+            "id": "quectel-original",
+            "manufacturer": "Quectel",
+            "product": "EG25-G",
+        }
+        self.unrelated = {
+            "id": "other-modem",
+            "manufacturer": "Other",
+            "product": "Other LTE modem",
+        }
+        self.now = 100.0
+        self.radio = diagnostics.empty_cell_metrics()
+        self.radio.update(EXPECTED_LTE, error=None)
+        self.discovery = self.contexts.enter_context(
+            mock.patch.object(
+                diagnostics, "discover_modem_api_base", return_value=API_BASE
+            )
+        )
+        self.inventory = self.contexts.enter_context(
+            mock.patch.object(
+                diagnostics, "request_json", return_value=[self.modem]
+            )
+        )
+        self.read_radio = self.contexts.enter_context(
+            mock.patch.object(
+                diagnostics, "read_cell_metrics", return_value=self.radio
+            )
+        )
+        self.contexts.enter_context(
+            mock.patch.object(
+                diagnostics.time, "monotonic", side_effect=lambda: self.now
+            )
+        )
+        self.monitor = diagnostics.ModemMonitor()
+
+    def test_present_inventory_is_checked_each_poll_and_api_is_cached(self):
+        first = self.monitor.poll()
+        second = self.monitor.poll()
+
+        for sample in (first, second):
+            self.assertIs(sample["modem_present"], True)
+            self.assertEqual(sample["modem_id"], self.modem["id"])
+            self.assertEqual(sample["radio"], self.radio)
+            self.assertEqual(sample["modem_disconnect_count"], 0)
+            self.assertEqual(sample["modem_event"], "")
+            checked = diagnostics.datetime.fromisoformat(sample["modem_checked_utc"])
+            self.assertIsNotNone(checked.utcoffset())
+        self.discovery.assert_called_once_with()
+        self.assertEqual(
+            self.inventory.call_args_list,
+            [mock.call(API_BASE + "/modem/")] * 2,
+        )
+
+    def test_disconnect_is_counted_once_and_reconnection_records_outage(self):
+        self.monitor.poll()
+        self.now = 110.0
+        self.inventory.return_value = []
+        disconnected = self.monitor.poll()
+        self.now = 120.0
+        missing = self.monitor.poll()
+        self.now = 135.5
+        self.inventory.return_value = [self.modem]
+        reconnected = self.monitor.poll()
+
+        self.assertIs(disconnected["modem_present"], False)
+        self.assertEqual(disconnected["modem_event"], "disconnected")
+        self.assertEqual(disconnected["modem_disconnect_count"], 1)
+        self.assertEqual(missing["modem_event"], "")
+        self.assertEqual(missing["modem_disconnect_count"], 1)
+        self.assertIs(reconnected["modem_present"], True)
+        self.assertEqual(reconnected["modem_event"], "reconnected")
+        self.assertEqual(reconnected["modem_disconnect_count"], 1)
+        self.assertAlmostEqual(reconnected["modem_outage_s"], 25.5)
+        self.assertEqual(self.read_radio.call_count, 2)
+
+    def test_startup_without_modem_keeps_polling_without_counting_disconnect(self):
+        self.inventory.return_value = []
+        absent = self.monitor.poll()
+        still_absent = self.monitor.poll()
+        self.read_radio.assert_not_called()
+        self.inventory.return_value = [self.modem]
+        appeared = self.monitor.poll()
+
+        self.assertIs(absent["modem_present"], False)
+        self.assertEqual(absent["modem_event"], "not_detected")
+        self.assertEqual(absent["modem_disconnect_count"], 0)
+        self.assertEqual(still_absent["modem_event"], "")
+        self.assertIs(appeared["modem_present"], True)
+        self.assertEqual(appeared["modem_disconnect_count"], 0)
+        self.read_radio.assert_called_once_with(API_BASE, self.modem["id"])
+
+    def test_inventory_outage_is_unknown_and_does_not_create_disconnect(self):
+        self.monitor.poll()
+        self.inventory.side_effect = RuntimeError("API unavailable")
+        unknown = self.monitor.poll()
+        self.inventory.side_effect = None
+        recovered = self.monitor.poll()
+
+        self.assertIsNone(unknown["modem_present"])
+        self.assertEqual(unknown["modem_event"], "")
+        self.assertEqual(unknown["modem_disconnect_count"], 0)
+        self.assertIn("API unavailable", unknown["radio"]["error"])
+        self.assertIs(recovered["modem_present"], True)
+        self.assertEqual(recovered["modem_event"], "")
+        self.assertEqual(recovered["modem_disconnect_count"], 0)
+
+    def test_unknown_gap_preserves_confirmed_disconnect_and_outage_duration(self):
+        self.monitor.poll()
+        self.now = 110.0
+        self.inventory.return_value = []
+        self.monitor.poll()
+        self.now = 120.0
+        self.inventory.side_effect = RuntimeError("API unavailable")
+        unknown = self.monitor.poll()
+        self.now = 140.0
+        self.inventory.side_effect = None
+        self.inventory.return_value = [self.modem]
+        reconnected = self.monitor.poll()
+
+        self.assertIsNone(unknown["modem_present"])
+        self.assertEqual(unknown["modem_disconnect_count"], 1)
+        self.assertEqual(reconnected["modem_event"], "reconnected")
+        self.assertEqual(reconnected["modem_disconnect_count"], 1)
+        self.assertAlmostEqual(reconnected["modem_outage_s"], 30.0)
+
+    def test_failed_inventory_retries_discovery_and_accepts_new_port(self):
+        self.monitor.poll()
+        new_base = "http://127.0.0.1:40001/v1.0"
+        self.discovery.return_value = new_base
+        self.inventory.side_effect = [RuntimeError("old port closed"), [self.modem]]
+        recovered = self.monitor.poll()
+
+        self.assertIs(recovered["modem_present"], True)
+        self.assertEqual(recovered["modem_event"], "")
+        self.assertEqual(self.discovery.call_count, 2)
+        self.assertEqual(
+            self.inventory.call_args_list[-2:],
+            [mock.call(API_BASE + "/modem/"), mock.call(new_base + "/modem/")],
+        )
+        self.read_radio.assert_called_with(new_base, self.modem["id"])
+
+    def test_initial_discovery_failure_is_unknown_and_later_recovers(self):
+        self.discovery.side_effect = RuntimeError("container unavailable")
+        unknown = self.monitor.poll()
+        self.discovery.side_effect = None
+        present = self.monitor.poll()
+
+        self.assertIsNone(unknown["modem_present"])
+        self.assertEqual(unknown["modem_disconnect_count"], 0)
+        self.assertIs(present["modem_present"], True)
+        self.assertEqual(present["modem_disconnect_count"], 0)
+
+    def test_radio_failure_does_not_mean_modem_was_disconnected(self):
+        self.read_radio.side_effect = RuntimeError("radio query timed out")
+        sample = self.monitor.poll()
+
+        self.assertIs(sample["modem_present"], True)
+        self.assertEqual(sample["modem_disconnect_count"], 0)
+        self.assertEqual(sample["modem_event"], "")
+        self.assertIn("radio query timed out", sample["radio"]["error"])
+
+    def test_prefers_eg25_and_keeps_original_id_after_inventory_reordering(self):
+        replacement = dict(self.modem, id="another-eg25")
+        self.inventory.return_value = [self.unrelated, self.modem]
+        selected = self.monitor.poll()
+        self.inventory.return_value = [replacement, self.unrelated, self.modem]
+        reordered = self.monitor.poll()
+
+        self.assertEqual(selected["modem_id"], self.modem["id"])
+        self.assertEqual(reordered["modem_id"], self.modem["id"])
+        self.assertEqual(reordered["modem_event"], "")
+        self.assertEqual(reordered["modem_disconnect_count"], 0)
+
+    def test_unrelated_modem_cannot_hide_tracked_modem_disconnection(self):
+        self.monitor.poll()
+        self.inventory.return_value = [self.unrelated]
+        missing = self.monitor.poll()
+
+        self.assertIs(missing["modem_present"], False)
+        self.assertEqual(missing["modem_event"], "disconnected")
+        self.assertEqual(missing["modem_disconnect_count"], 1)
+        self.assertEqual(self.read_radio.call_count, 1)
+
+    def test_known_second_modem_cannot_hide_disconnect_or_take_reconnection(self):
+        other_eg25 = dict(self.modem, id="second-eg25")
+        replacement = dict(self.modem, id="reenumerated-eg25")
+        self.inventory.return_value = [self.modem, other_eg25]
+        selected = self.monitor.poll()
+        self.now = 110.0
+        self.inventory.return_value = [other_eg25]
+        missing = self.monitor.poll()
+        self.now = 120.0
+        self.inventory.return_value = [other_eg25, replacement]
+        reconnected = self.monitor.poll()
+
+        self.assertEqual(selected["modem_id"], self.modem["id"])
+        self.assertIs(missing["modem_present"], False)
+        self.assertEqual(missing["modem_event"], "disconnected")
+        self.assertEqual(missing["modem_disconnect_count"], 1)
+        self.assertIs(reconnected["modem_present"], True)
+        self.assertEqual(reconnected["modem_id"], replacement["id"])
+        self.assertEqual(reconnected["modem_event"], "reconnected")
+        self.assertEqual(reconnected["modem_disconnect_count"], 1)
+        self.assertAlmostEqual(reconnected["modem_outage_s"], 10.0)
+        self.assertEqual(
+            self.read_radio.call_args_list,
+            [
+                mock.call(API_BASE, self.modem["id"]),
+                mock.call(API_BASE, replacement["id"]),
+            ],
+        )
+
+    def test_reused_id_with_different_product_or_manufacturer_is_missing(self):
+        for changes in (
+            {"product": "Different modem"},
+            {"manufacturer": "Different manufacturer"},
+        ):
+            with self.subTest(changes=changes):
+                monitor = diagnostics.ModemMonitor()
+                self.inventory.return_value = [self.modem]
+                monitor.poll()
+                self.read_radio.reset_mock()
+                self.inventory.return_value = [dict(self.modem, **changes)]
+                missing = monitor.poll()
+
+                self.assertIs(missing["modem_present"], False)
+                self.assertEqual(missing["modem_event"], "disconnected")
+                self.assertEqual(missing["modem_disconnect_count"], 1)
+                self.read_radio.assert_not_called()
+
+    def test_new_id_for_same_model_reports_change_or_reconnection(self):
+        self.monitor.poll()
+        replacement = dict(self.modem, id="quectel-new-id")
+        self.inventory.return_value = [replacement]
+        changed = self.monitor.poll()
+        self.assertIs(changed["modem_present"], True)
+        self.assertEqual(changed["modem_id"], replacement["id"])
+        self.assertEqual(changed["modem_event"], "changed")
+        self.assertEqual(changed["modem_disconnect_count"], 0)
+
+        self.now = 110.0
+        self.inventory.return_value = []
+        self.monitor.poll()
+        self.now = 120.0
+        self.inventory.return_value = [self.modem]
+        reconnected = self.monitor.poll()
+        self.assertEqual(reconnected["modem_id"], self.modem["id"])
+        self.assertEqual(reconnected["modem_event"], "reconnected")
+        self.assertEqual(reconnected["modem_disconnect_count"], 1)
+        self.assertAlmostEqual(reconnected["modem_outage_s"], 10.0)
+
+    def test_malformed_inventory_is_unknown_instead_of_disconnect(self):
+        self.monitor.poll()
+        for invalid in (None, {"modems": []}, "bad response", [{}], [None]):
+            with self.subTest(inventory=invalid):
+                self.inventory.return_value = invalid
+                sample = self.monitor.poll()
+                self.assertIsNone(sample["modem_present"])
+                self.assertEqual(sample["modem_event"], "")
+                self.assertEqual(sample["modem_disconnect_count"], 0)
+                self.assertTrue(sample["radio"]["error"])
+        self.inventory.return_value = [self.modem]
+        recovered = self.monitor.poll()
+        self.assertIs(recovered["modem_present"], True)
+        self.assertEqual(recovered["modem_event"], "")
+
+    def test_main_writes_csv_through_startup_absence_and_reconnections(self):
+        log_directory = Path(
+            self.contexts.enter_context(tempfile.TemporaryDirectory())
+        )
+        self.contexts.enter_context(
+            mock.patch.object(diagnostics, "LOG_DIRECTORY", log_directory)
+        )
+        self.contexts.enter_context(
+            mock.patch.object(
+                diagnostics,
+                "ping_stats",
+                return_value={"reachable": True, "loss": 0, "avg": 12, "mdev": 1},
+            )
+        )
+        self.contexts.enter_context(
+            mock.patch.object(diagnostics, "route_interface", return_value="usb1")
+        )
+        terminal = self.contexts.enter_context(mock.patch("builtins.print"))
+        self.inventory.side_effect = [[], [self.modem], [], [self.modem]]
+        cycles = 0
+
+        def advance_or_stop(seconds):
+            nonlocal cycles
+            cycles += 1
+            self.now += seconds
+            if cycles == 4:
+                raise KeyboardInterrupt
+
+        self.contexts.enter_context(
+            mock.patch.object(diagnostics.time, "sleep", side_effect=advance_or_stop)
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            diagnostics.main()
+
+        logs = list(log_directory.glob("cell-link-log-*.csv"))
+        self.assertEqual(len(logs), 1)
+        with logs[0].open(newline="") as file:
+            rows = list(csv.DictReader(file))
+
+        self.assertEqual(
+            [row["modem_event"] for row in rows],
+            ["not_detected", "reconnected", "disconnected", "reconnected"],
+        )
+        self.assertEqual(
+            [row["modem_present"] for row in rows],
+            ["False", "True", "False", "True"],
+        )
+        self.assertEqual(
+            [row["modem_disconnect_count"] for row in rows], ["0", "0", "1", "1"]
+        )
+        self.assertEqual(float(rows[-1]["modem_outage_s"]), diagnostics.LOG_PERIOD_S)
+        for row in rows:
+            self.assertTrue(row["modem_checked_utc"])
+            self.assertEqual(row["consecutive_laptop_failures"], "0")
+        self.assertTrue(rows[0]["error"])
+        self.assertFalse(rows[-1]["error"])
+        self.assertTrue(
+            any("DISCONNECTED" in str(call) for call in terminal.call_args_list)
+        )
 
 
 if __name__ == "__main__":

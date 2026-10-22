@@ -52,14 +52,15 @@ PING_COUNT = 3
 # Ping timeout in seconds
 PING_TIMEOUT_S = 2
 
-# Time between logging cycles
+# Time between logging cycles, including modem-presence checks.
+# Disconnects entirely between checks may be missed.
 LOG_PERIOD_S = 10
 
 
-# CSV is saved in the same folder as this script.
-LOG_FILE = Path(__file__).with_name(
-    "cell_link_log.csv"
-)
+# Each run creates a CSV in the same folder as this script.
+# Filename: cell-link-log-YEAR-DAY-MONTH-HHMMSS.csv (24-hour UTC).
+# The date and time come from the Pi's system clock.
+LOG_DIRECTORY = Path(__file__).resolve().parent
 
 
 # ============================================================
@@ -163,49 +164,145 @@ def request_json(url, *, method="GET"):
 # MODEM DISCOVERY
 # ============================================================
 
-def find_modem(api_base):
-    """
-    Ask Cellular Modem Manager which modems are connected.
+def select_modem(modems, previous_modem=None, excluded_ids=()):
+    """Retain the selected modem, allowing its USB path/ID to change."""
 
-    Prefer the Quectel EG25-G used by the BlueBoat.
-    """
+    if previous_modem is not None:
+        for modem in modems:
+            if (
+                modem["id"] == previous_modem["id"]
+                and all(
+                    not previous_modem.get(key)
+                    or modem.get(key) == previous_modem[key]
+                    for key in ("manufacturer", "product")
+                )
+            ):
+                return modem
 
-    modems = request_json(
-        f"{api_base}/modem/"
-    )
+        # A re-enumerated EG25 can have a new ID. Do not switch to
+        # unrelated hardware just because it remains connected.
+        for modem in modems:
+            if (
+                modem["id"] not in excluded_ids
+                and previous_modem.get("product")
+                and modem.get("product") == previous_modem["product"]
+                and modem.get("manufacturer") == previous_modem.get("manufacturer")
+            ):
+                return modem
+        return None
 
-    if not modems:
-        raise RuntimeError(
-            "Cellular Modem Manager reported no modems."
-        )
-
-    # Prefer EG25-G if there are multiple devices.
     for modem in modems:
+        if "EG25" in str(modem.get("product", "")).upper():
+            return modem
 
-        product = str(
-            modem.get("product", "")
-        ).upper()
+    return modems[0] if modems else None
 
-        if "EG25" in product:
 
-            print(
-                "Using modem:",
-                modem.get("manufacturer"),
-                modem.get("product"),
-            )
+class ModemMonitor:
+    """Track observed hardware presence independently of radio/API failures."""
 
-            return modem["id"]
+    def __init__(self):
+        self.api_base = None
+        self.modem = None
+        self.last_present = None
+        self.disconnect_count = 0
+        self.disconnected_at = None
+        self.other_modem_ids = set()
 
-    # Fall back to the first modem.
-    modem = modems[0]
+    def poll(self):
+        radio = empty_cell_metrics()
+        present = None
+        selected = None
 
-    print(
-        "Using modem:",
-        modem.get("manufacturer"),
-        modem.get("product"),
-    )
+        for attempt in range(2):
+            try:
+                if self.api_base is None or attempt:
+                    self.api_base = discover_modem_api_base()
 
-    return modem["id"]
+                modems = request_json(f"{self.api_base}/modem/")
+                if (
+                    not isinstance(modems, list)
+                    or any(
+                        not isinstance(modem, dict)
+                        or not isinstance(modem.get("id"), str)
+                        or not modem["id"]
+                        for modem in modems
+                    )
+                ):
+                    raise ValueError("Invalid modem inventory response.")
+
+                selected = select_modem(
+                    modems,
+                    self.modem,
+                    self.other_modem_ids,
+                )
+                # An identical modem that was already present must not
+                # hide the disappearance of the one we were monitoring.
+                self.other_modem_ids.update(
+                    modem["id"]
+                    for modem in modems
+                    if selected is None or modem["id"] != selected["id"]
+                )
+                present = selected is not None
+                break
+
+            except Exception as error:
+                self.api_base = None
+                radio["error"] = (
+                    "Cellular: modem presence unknown: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+        # These timestamps describe when presence was observed; they
+        # cannot establish the exact time of a change between polls.
+        checked_utc = datetime.now(timezone.utc).isoformat()
+        checked_at = time.monotonic()
+        event = ""
+        outage_s = None
+
+        if present is False:
+            if self.last_present is not False:
+                self.disconnected_at = checked_at
+                if self.last_present is True:
+                    self.disconnect_count += 1
+                    event = "disconnected"
+                else:
+                    event = "not_detected"
+            outage_s = round(checked_at - self.disconnected_at, 1)
+            radio["error"] = "Cellular: monitored modem is not detected."
+
+        elif present is True:
+            if self.last_present is False:
+                event = "reconnected"
+                outage_s = round(checked_at - self.disconnected_at, 1)
+                self.disconnected_at = None
+            elif self.modem is not None and selected["id"] != self.modem["id"]:
+                event = "changed"
+
+            self.modem = selected
+            try:
+                radio = read_cell_metrics(self.api_base, selected["id"])
+            except Exception as error:
+                radio = empty_cell_metrics()
+                radio["error"] = (
+                    "Cellular: radio query failed while modem was detected: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+        # An unknown API result leaves the last confirmed presence and
+        # outage start intact, without inventing hardware transitions.
+        if present is not None:
+            self.last_present = present
+
+        return {
+            "radio": radio,
+            "modem_id": self.modem["id"] if self.modem else None,
+            "modem_present": present,
+            "modem_event": event,
+            "modem_disconnect_count": self.disconnect_count,
+            "modem_outage_s": outage_s,
+            "modem_checked_utc": checked_utc,
+        }
 
 
 # ============================================================
@@ -737,6 +834,14 @@ CSV_FIELDS = [
     "timestamp_utc",
     "elapsed_s",
 
+    # Hardware presence, observed changes, and duration since absence
+    "modem_id",
+    "modem_present",
+    "modem_event",
+    "modem_disconnect_count",
+    "modem_outage_s",
+    "modem_checked_utc",
+
     # Cellular radio measurements
     "rat",
     "cell_id",
@@ -778,6 +883,24 @@ CSV_FIELDS = [
 # MAIN LOGGER
 # ============================================================
 
+def create_log_file():
+    """Create a separate CSV for this run without replacing existing logs."""
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%d-%m-%H%M%S")
+    stem = f"cell-link-log-{timestamp}"
+    attempt = 0
+
+    while True:
+        suffix = f"-{attempt}" if attempt else ""
+        log_file = LOG_DIRECTORY / f"{stem}{suffix}.csv"
+
+        try:
+            # Exclusive creation also keeps simultaneous runs separate.
+            return log_file.open("x", newline="", buffering=1)
+        except FileExistsError:
+            attempt += 1
+
+
 def main():
 
     # --------------------------------------------------------
@@ -794,51 +917,16 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Discover Cellular Modem Manager
+    # Start monitoring, including when the modem is initially absent
     # --------------------------------------------------------
 
     print(
-        "Finding Cellular Modem Manager..."
-    )
-
-    api_base = discover_modem_api_base()
-
-    print(
-        "Cellular Modem Manager API:",
-        api_base,
-    )
-
-    # --------------------------------------------------------
-    # Discover modem
-    # --------------------------------------------------------
-
-    modem_id = find_modem(
-        api_base
-    )
-
-    print(
-        "Modem ID:",
-        modem_id,
+        "Monitoring Cellular Modem Manager..."
     )
 
     print(
         "Laptop ZeroTier IP:",
         LAPTOP_ZT_IP,
-    )
-
-    print(
-        "Log file:",
-        LOG_FILE,
-    )
-
-    print(
-        "Logging every",
-        LOG_PERIOD_S,
-        "seconds."
-    )
-
-    print(
-        "Press Ctrl+C to stop.\n"
     )
 
     # --------------------------------------------------------
@@ -849,28 +937,35 @@ def main():
 
     consecutive_failures = 0
 
-    new_file = (
-        not LOG_FILE.exists()
-        or LOG_FILE.stat().st_size == 0
-    )
+    modem_monitor = ModemMonitor()
 
     # --------------------------------------------------------
     # Open CSV
     # --------------------------------------------------------
 
-    with LOG_FILE.open(
-        "a",
-        newline="",
-        buffering=1,
-    ) as file:
+    with create_log_file() as file:
+
+        print(
+            "Log file (UTC filename):",
+            file.name,
+        )
+
+        print(
+            "Logging every",
+            LOG_PERIOD_S,
+            "seconds."
+        )
+
+        print(
+            "Press Ctrl+C to stop.\n"
+        )
 
         writer = csv.DictWriter(
             file,
             fieldnames=CSV_FIELDS,
         )
 
-        if new_file:
-            writer.writeheader()
+        writer.writeheader()
 
         # ====================================================
         # MAIN LOOP
@@ -883,57 +978,11 @@ def main():
             error_messages = []
 
             # ------------------------------------------------
-            # Read cellular metrics
+            # Check modem presence and read cellular metrics
             # ------------------------------------------------
 
-            try:
-
-                radio = read_cell_metrics(
-                    api_base,
-                    modem_id,
-                )
-
-            except Exception as first_error:
-
-                # The extension might have restarted and
-                # received a different Docker host port.
-                #
-                # Try rediscovery once before recording a
-                # failure.
-                try:
-
-                    print(
-                        "Cellular API query failed; "
-                        "attempting rediscovery..."
-                    )
-
-                    api_base = (
-                        discover_modem_api_base()
-                    )
-
-                    modem_id = find_modem(
-                        api_base
-                    )
-
-                    radio = read_cell_metrics(
-                        api_base,
-                        modem_id,
-                    )
-
-                    print(
-                        "Cellular API rediscovered:",
-                        api_base,
-                    )
-
-                except Exception as second_error:
-
-                    radio = empty_cell_metrics()
-
-                    error_messages.append(
-                        "Cellular: "
-                        f"{type(second_error).__name__}: "
-                        f"{second_error}"
-                    )
+            modem_sample = modem_monitor.poll()
+            radio = modem_sample["radio"]
 
             if radio["error"]:
                 error_messages.append(radio["error"])
@@ -1006,6 +1055,14 @@ def main():
                         - start_time,
                         1,
                     ),
+
+                # Hardware disconnects are separate from ping failures.
+                "modem_id": modem_sample["modem_id"],
+                "modem_present": modem_sample["modem_present"],
+                "modem_event": modem_sample["modem_event"],
+                "modem_disconnect_count": modem_sample["modem_disconnect_count"],
+                "modem_outage_s": modem_sample["modem_outage_s"],
+                "modem_checked_utc": modem_sample["modem_checked_utc"],
 
                 # Cellular
                 "rat":
@@ -1093,11 +1150,20 @@ def main():
             # Terminal display
             # ------------------------------------------------
 
+            modem_status = {
+                True: "present",
+                False: "missing",
+                None: "unknown",
+            }[row["modem_present"]]
+
             print(
                 f"{row['timestamp_utc']} | "
+                f"Modem={modem_status} | "
+                f"Disconnects={row['modem_disconnect_count']} | "
                 f"RAT={row['rat']} | "
                 f"RSRP={row['rsrp_dbm']} dBm | "
                 f"RSRQ={row['rsrq_db']} dB | "
+                f"RSSI={row['rssi_dbm']} dBm | "
                 f"SINR={row['sinr_db']} dB | "
                 f"Laptop RTT="
                 f"{row['laptop_rtt_avg_ms']} ms | "
@@ -1108,6 +1174,15 @@ def main():
                 f"Internet IF="
                 f"{row['internet_egress_if']}"
             )
+
+            if row["modem_event"]:
+                print(
+                    "  MODEM",
+                    row["modem_event"].replace("_", " ").upper(),
+                    f"at {row['modem_checked_utc']} | "
+                    f"ID={row['modem_id']} | "
+                    f"Observed outage={row['modem_outage_s']} s",
+                )
 
             if row["error"]:
 

@@ -136,13 +136,18 @@ def discover_modem_api_base():
 # HTTP HELPERS
 # ============================================================
 
-def request_json(url):
+def request_json(url, *, method="GET"):
     """
-    Perform a GET request and decode the JSON response.
+    Perform an HTTP request and decode the JSON response.
     """
 
-    with urllib.request.urlopen(
+    request = urllib.request.Request(
         url,
+        method=method,
+    )
+
+    with urllib.request.urlopen(
+        request,
         timeout=5,
     ) as response:
 
@@ -245,7 +250,11 @@ def find_value_recursive(obj, possible_keys):
             # First search the current level.
             for key, value in item.items():
 
-                if normalize_key(key) in wanted:
+                if (
+                    normalize_key(key) in wanted
+                    and value is not None
+                    and value != ""
+                ):
                     return value
 
             # Then search children.
@@ -274,6 +283,64 @@ def find_value_recursive(obj, possible_keys):
 # CELLULAR MEASUREMENTS
 # ============================================================
 
+def parse_quectel_lte_serving_cell(response):
+    """
+    Extract LTE measurements from AT+QENG="servingcell".
+
+    The modem manager's /cell response omits RSRQ, RSSI, PCI,
+    EARFCN and band. Its /commander endpoint exposes the full
+    Quectel response without opening the serial port ourselves.
+    """
+
+    if not isinstance(response, str):
+        raise ValueError("Expected a raw Quectel response string.")
+
+    for line in response.splitlines():
+
+        match = re.match(r"\s*\+QENG:\s*(.*)", line)
+
+        if not match:
+            continue
+
+        fields = next(csv.reader(
+            [match.group(1)],
+            skipinitialspace=True,
+        ))
+
+        if (
+            len(fields) < 3
+            or fields[0].strip().lower() != "servingcell"
+            or fields[2].strip().upper() != "LTE"
+        ):
+            continue
+
+        if len(fields) < 17:
+            raise ValueError("Incomplete LTE serving-cell response.")
+
+        def number(index, base=10):
+            value = fields[index].strip()
+            if value in ("", "-"):
+                return None
+            return int(value, base)
+
+        # Field order is defined by Quectel's QENG LTE format.
+        # Cell ID is hexadecimal, even when it contains only digits.
+        # Signal measurements are already in dBm/dB; SINR 0 is valid.
+        return {
+            "rat": "LTE",
+            "cell_id": number(6, base=16),
+            "pcid": number(7),
+            "earfcn": number(8),
+            "lte_band": number(9),
+            "rsrp_dbm": number(13),
+            "rsrq_db": number(14),
+            "rssi_dbm": number(15),
+            "sinr_db": number(16),
+        }
+
+    raise ValueError("No LTE serving-cell measurements in Quectel response.")
+
+
 def read_cell_metrics(api_base, modem_id):
     """
     Ask Blue Robotics Cellular Modem Manager for its parsed
@@ -295,12 +362,26 @@ def read_cell_metrics(api_base, modem_id):
 
     data = request_json(url)
 
+    # Never substitute neighboring-cell measurements for the serving cell.
+    serving_cell = data
+    if isinstance(data, dict):
+        if "serving_cell" in data:
+            serving_cell = data["serving_cell"]
+        else:
+            serving_cell = {
+                key: value
+                for key, value in data.items()
+                if normalize_key(key) not in (
+                    "neighbor_cells", "neighbour_cells",
+                )
+            }
+
     metrics = {
 
         # Radio access technology:
         # LTE, WCDMA, etc.
         "rat": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "rat",
                 "access_technology",
@@ -309,7 +390,7 @@ def read_cell_metrics(api_base, modem_id):
         ),
 
         "cell_id": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "cell_id",
                 "cellid",
@@ -319,7 +400,7 @@ def read_cell_metrics(api_base, modem_id):
 
         # Physical Cell ID
         "pcid": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "pcid",
                 "pci",
@@ -329,23 +410,24 @@ def read_cell_metrics(api_base, modem_id):
 
         # LTE channel number
         "earfcn": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "earfcn",
             ],
         ),
 
         "lte_band": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "band",
                 "lte_band",
+                "freq_band_ind",
             ],
         ),
 
         # Main signal-strength metric
         "rsrp_dbm": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "rsrp",
                 "rsrp_dbm",
@@ -354,7 +436,7 @@ def read_cell_metrics(api_base, modem_id):
 
         # Signal quality
         "rsrq_db": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "rsrq",
                 "rsrq_db",
@@ -363,7 +445,7 @@ def read_cell_metrics(api_base, modem_id):
 
         # Total received power
         "rssi_dbm": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "rssi",
                 "rssi_dbm",
@@ -372,7 +454,7 @@ def read_cell_metrics(api_base, modem_id):
 
         # Signal-to-interference/noise metric
         "sinr_db": find_value_recursive(
-            data,
+            serving_cell,
             [
                 "sinr",
                 "snr",
@@ -390,7 +472,63 @@ def read_cell_metrics(api_base, modem_id):
             data,
             separators=(",", ":"),
         ),
+
+        "error": None,
     }
+
+    if str(metrics["rat"]).upper() == "LTE":
+
+        # These generic API fields mean RSRP and SINR for LTE.
+        # Other technologies use them for different measurements.
+        for metric, api_key in (
+            ("rsrp_dbm", "signal_quality_dbm"),
+            ("sinr_db", "signal_inr_db"),
+        ):
+            if metrics[metric] is None:
+                metrics[metric] = find_value_recursive(
+                    serving_cell,
+                    [api_key],
+                )
+
+        if any(
+            metrics[key] is None
+            for key in (
+                "cell_id", "pcid", "earfcn", "lte_band",
+                "rsrp_dbm", "rsrq_db", "rssi_dbm", "sinr_db",
+            )
+        ):
+
+            raw_data = (
+                dict(data)
+                if isinstance(data, dict)
+                else {"cell": data}
+            )
+
+            try:
+                query = urllib.parse.urlencode({
+                    "command": 'AT+QENG="servingcell"',
+                })
+                response = request_json(
+                    f"{api_base}/modem/{modem_id_encoded}/commander?{query}",
+                    method="POST",
+                )
+                raw_data["qeng_raw"] = response
+                # Keep the complete raw observation together if the
+                # serving cell changed since the /cell request.
+                metrics.update(parse_quectel_lte_serving_cell(response))
+
+            except Exception as error:
+                # Retain any measurements already supplied by /cell.
+                raw_data["qeng_error"] = f"{type(error).__name__}: {error}"
+                metrics["error"] = (
+                    "Cellular: LTE detail query failed: "
+                    f"{raw_data['qeng_error']}"
+                )
+
+            metrics["cell_json"] = json.dumps(
+                raw_data,
+                separators=(",", ":"),
+            )
 
     return metrics
 
@@ -411,6 +549,7 @@ def empty_cell_metrics():
         "rssi_dbm": None,
         "sinr_db": None,
         "cell_json": None,
+        "error": None,
     }
 
 
@@ -796,6 +935,27 @@ def main():
                         f"{second_error}"
                     )
 
+            if radio["error"]:
+                error_messages.append(radio["error"])
+
+            if (
+                radio["cell_json"] is not None
+                and all(
+                    radio[key] is None
+                    for key in (
+                        "rsrp_dbm",
+                        "rsrq_db",
+                        "rssi_dbm",
+                        "sinr_db",
+                    )
+                )
+            ):
+
+                error_messages.append(
+                    "Cellular: modem API returned no signal readings; "
+                    "see cell_json in the CSV for the raw response."
+                )
+
             # ------------------------------------------------
             # Ping laptop over ZeroTier
             # ------------------------------------------------
@@ -935,6 +1095,7 @@ def main():
 
             print(
                 f"{row['timestamp_utc']} | "
+                f"RAT={row['rat']} | "
                 f"RSRP={row['rsrp_dbm']} dBm | "
                 f"RSRQ={row['rsrq_db']} dB | "
                 f"SINR={row['sinr_db']} dB | "

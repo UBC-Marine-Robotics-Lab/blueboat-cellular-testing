@@ -26,7 +26,11 @@ from pathlib import Path
 # Example:
 # LAPTOP_ZT_IP = "10.147.20.23"
 #
-LAPTOP_ZT_IP = "CHANGE_ME"
+
+EMMA_E14_ZT_IP = "10.41.236.148"
+MAKAYLA_ZT_IP = "10.41.236.163"
+
+LAPTOP_ZT_IP = EMMA_E14_ZT_IP
 
 
 # Internal port used by the Blue Robotics

@@ -57,10 +57,10 @@ PING_TIMEOUT_S = 2
 LOG_PERIOD_S = 10
 
 
-# Each run creates a CSV in the same folder as this script.
+# Each run creates a CSV in the logs subdirectory beside this script.
 # Filename: cell-link-log-YEAR-DAY-MONTH-HHMMSS.csv (24-hour UTC).
 # The date and time come from the Pi's system clock.
-LOG_DIRECTORY = Path(__file__).resolve().parent
+LOG_DIRECTORY = Path(__file__).resolve().parent / "logs"
 
 
 # ============================================================
@@ -885,6 +885,8 @@ CSV_FIELDS = [
 
 def create_log_file():
     """Create a separate CSV for this run without replacing existing logs."""
+
+    LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%d-%m-%H%M%S")
     stem = f"cell-link-log-{timestamp}"

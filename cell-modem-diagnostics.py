@@ -57,10 +57,10 @@ PING_TIMEOUT_S = 2
 LOG_PERIOD_S = 10
 
 
-# Each run creates a CSV in the logs subdirectory beside this script.
+# Each run creates a CSV in ~/blueboat-cellular-logs.
 # Filename: cell-link-log-YEAR-DAY-MONTH-HHMMSS.csv (24-hour UTC).
 # The date and time come from the Pi's system clock.
-LOG_DIRECTORY = Path(__file__).resolve().parent / "logs"
+LOG_DIRECTORY = Path.home() / "blueboat-cellular-logs"
 
 
 # ============================================================
